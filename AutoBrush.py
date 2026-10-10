@@ -12,6 +12,7 @@ bl_info = {
 import bpy
 import math
 from mathutils import Vector
+from bpy_extras import view3d_utils
 
 def find_viewport():
     """Find a 3D View and its main drawing region."""
@@ -61,56 +62,69 @@ def get_world_center(obj):
 
     return sum(corners, Vector()) / len(corners)
 
-def calculate_brush_size(region, rv3d, focus, world_radius):
-    """
-    Return distance and calculated brush size.
+LAST_MOUSE = {"x": None, "y": None}
 
-    The size is estimated from the viewport projection at the
-    focus object's depth.
-    """
+def get_surface_point(context, region, rv3d, focus):
+    """Raycast from the mouse (or region center) onto the focus object."""
 
-    center = get_world_center(focus)
+    if LAST_MOUSE["x"] is not None:
+        coord = Vector((
+            LAST_MOUSE["x"] - region.x,
+            LAST_MOUSE["y"] - region.y,
+        ))
+        if not (0 <= coord.x <= region.width and 0 <= coord.y <= region.height):
+            coord = Vector((region.width / 2, region.height / 2))
+    else:
+        coord = Vector((region.width / 2, region.height / 2))
+
+    origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+    direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+
+    inv = focus.matrix_world.inverted()
+    origin_local = inv @ origin
+    direction_local = (inv.to_3x3() @ direction).normalized()
+
+    depsgraph = context.evaluated_depsgraph_get()
+    hit, location, normal, index = focus.ray_cast(
+        origin_local, direction_local, depsgraph=depsgraph
+    )
+
+    if hit:
+        return focus.matrix_world @ location, True
+
+    return get_world_center(focus), False
+
+
+def calculate_brush_size(context, region, rv3d, focus, world_radius):
+    """Brush diameter in px for a world-space radius at the surface point."""
+
+    point, _hit = get_surface_point(context, region, rv3d, focus)
 
     view_matrix = rv3d.view_matrix
-    inverse_view = view_matrix.inverted()
+    view_position = view_matrix.inverted().translation.copy()
+    distance = (point - view_position).length
 
-    view_position = inverse_view.translation.copy()
-    distance = (center - view_position).length
-
-    center_view = view_matrix @ center
-    depth = -center_view.z
-
-    if region.height <= 0:
+    if region.width <= 0 or region.height <= 0:
         return distance, None
 
-    projection = rv3d.perspective_matrix @ inverse_view
-
-    if rv3d.view_perspective == 'PERSP':
-        if depth <= 0.00001:
-            return distance, None
-
-        pixels_per_unit = (
-            abs(projection[1][1])
-            * region.height
-            / (2.0 * depth)
-        )
-    else:
-        pixels_per_unit = (
-            abs(projection[1][1])
-            * region.height
-            / 2.0
-        )
-
-    if not math.isfinite(pixels_per_unit):
+    point_view = view_matrix @ point
+    if rv3d.view_perspective == 'PERSP' and point_view.z >= -0.00001:
         return distance, None
 
-    if pixels_per_unit <= 0:
+    right = rv3d.view_rotation @ Vector((1.0, 0.0, 0.0))
+    up = rv3d.view_rotation @ Vector((0.0, 1.0, 0.0))
+
+    p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, point)
+    r2d = view3d_utils.location_3d_to_region_2d(region, rv3d, point + right * world_radius)
+    u2d = view3d_utils.location_3d_to_region_2d(region, rv3d, point + up * world_radius)
+
+    if p2d is None or r2d is None or u2d is None:
         return distance, None
 
-    calculated = round(world_radius * pixels_per_unit)
-    calculated = max(1, min(5000, calculated))
+    radius_px = ((r2d - p2d).length + (u2d - p2d).length) / 2.0
+    diameter = max(1, min(5000, round(radius_px * 2)))
 
-    return distance, calculated
+    return distance, diameter
 
 def refresh_viewports():
     wm = bpy.context.window_manager
@@ -164,6 +178,7 @@ def update_texture_brush():
 
     try:
         distance, calculated = calculate_brush_size(
+            context,
             region,
             rv3d,
             focus,
@@ -229,6 +244,22 @@ def update_texture_brush():
     refresh_viewports()
     return 0.1
 
+class VIEW3D_OT_tp_track_mouse(bpy.types.Operator):
+    bl_idname = "view3d.tp_track_mouse"
+    bl_label = "Start Mouse Tracking"
+
+    def modal(self, context, event):
+        if not hasattr(bpy.types.Scene, "tp_world_enabled"):
+            return {'CANCELLED'}
+        if event.type == 'MOUSEMOVE':
+            LAST_MOUSE["x"] = event.mouse_x
+            LAST_MOUSE["y"] = event.mouse_y
+        return {'PASS_THROUGH'}
+
+    def invoke(self, context, event):
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
 class VIEW3D_PT_texture_paint_world_radius(bpy.types.Panel):
     bl_label = "Texture Paint World Radius"
     bl_idname = "VIEW3D_PT_texture_paint_world_radius"
@@ -258,6 +289,8 @@ class VIEW3D_PT_texture_paint_world_radius(bpy.types.Panel):
             text="Apply Automatically",
         )
 
+        layout.operator("view3d.tp_track_mouse", icon='RESTRICT_SELECT_OFF')
+
         layout.separator()
 
         box = layout.box()
@@ -278,6 +311,7 @@ class VIEW3D_PT_texture_paint_world_radius(bpy.types.Panel):
         layout.label(text="Texture Paint mode only")
 
 CLASSES = (
+    VIEW3D_OT_tp_track_mouse,
     VIEW3D_PT_texture_paint_world_radius,
 )
 
